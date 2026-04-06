@@ -236,17 +236,13 @@ export class ClaudeSubprocess extends EventEmitter {
     ];
 
     if (options.sessionId) {
-      // Always use --session-id for both new and resumed sessions.
-      // --session-id creates the session if it doesn't exist, or continues
-      // it if it does — and always accepts stdin as the new prompt.
-      //
-      // IMPORTANT: Do NOT use `--resume <id>`. In Claude Code CLI, --resume
-      // is a boolean flag that resumes the *last* session. Passing a session
-      // ID after it causes the ID to be treated as a positional argument
-      // (prompt text), not a session identifier. This caused the CLI to
-      // replay the previous session instead of continuing with the new prompt,
-      // making conversations appear to "restart" in a loop.
-      args.push("--session-id", options.sessionId);
+      if (options.isNewSession) {
+        // New conversation: create session with explicit ID
+        args.push("--session-id", options.sessionId);
+      } else {
+        // Continuation: resume existing session (CLI has full history)
+        args.push("--resume", options.sessionId);
+      }
     }
 
     // System prompt only needed for new sessions
