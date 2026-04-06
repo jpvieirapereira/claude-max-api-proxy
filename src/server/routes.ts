@@ -316,6 +316,33 @@ async function handleStreamingResponse(
 
     subprocess.on("result", (result: ClaudeCliResult) => {
       isComplete = true;
+
+      // Detect CLI-level errors (auth failures, permission errors, etc.)
+      if (result.is_error && !res.writableEnded) {
+        const errMsg = result.result || "Claude CLI returned an error";
+        const isAuthError = /not logged in|please run \/login|auth|unauthorized/i.test(errMsg);
+        console.error(`[Streaming] CLI error result: ${errMsg.slice(0, 300)}`);
+
+        // Invalidate the session so it's not reused in a broken state
+        if (cliInput.sessionId) {
+          sessionManager.invalidateByClaudeSessionId(cliInput.sessionId);
+        }
+
+        res.write(`data: ${JSON.stringify({
+          error: {
+            message: isAuthError
+              ? `Claude CLI auth error: ${errMsg}. Run "claude auth login" on the server.`
+              : `Claude CLI error: ${errMsg}`,
+            type: isAuthError ? "authentication_error" : "server_error",
+            code: isAuthError ? "not_authenticated" : null,
+          },
+        })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+        done();
+        return;
+      }
+
       if (!res.writableEnded) {
         // Send final done chunk with finish_reason and usage data
         const doneChunk = createDoneChunk(requestId, lastModel);
@@ -419,18 +446,42 @@ async function handleNonStreamingResponse(
 
     subprocess.on("error", (error: Error) => {
       console.error("[NonStreaming] Error:", error.message);
-      res.status(500).json({
-        error: {
-          message: error.message,
-          type: "server_error",
-          code: null,
-        },
-      });
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: {
+            message: error.message,
+            type: "server_error",
+            code: null,
+          },
+        });
+      }
       resolve();
     });
 
     subprocess.on("close", (code: number | null) => {
-      if (finalResult) {
+      if (finalResult && finalResult.is_error) {
+        // CLI returned an error result — don't forward as content
+        const errMsg = finalResult.result || "Claude CLI returned an error";
+        const isAuthError = /not logged in|please run \/login|auth|unauthorized/i.test(errMsg);
+        console.error(`[NonStreaming] CLI error result: ${errMsg.slice(0, 300)}`);
+
+        // Invalidate the session so it's not reused in a broken state
+        if (cliInput.sessionId) {
+          sessionManager.invalidateByClaudeSessionId(cliInput.sessionId);
+        }
+
+        if (!res.headersSent) {
+          res.status(isAuthError ? 401 : 502).json({
+            error: {
+              message: isAuthError
+                ? `Claude CLI auth error: ${errMsg}. Run "claude auth login" on the server.`
+                : `Claude CLI error: ${errMsg}`,
+              type: isAuthError ? "authentication_error" : "server_error",
+              code: isAuthError ? "not_authenticated" : null,
+            },
+          });
+        }
+      } else if (finalResult) {
         res.json(cliResultToOpenai(finalResult, requestId));
       } else if (!res.headersSent) {
         res.status(500).json({
