@@ -58,10 +58,19 @@ export async function handleChatCompletions(
       cliInput.systemPrompt = undefined; // CLI already has it
       console.log(`[Route] Resuming session for agent ${cliInput.agentKey} → ${existingSession.claudeSessionId}`);
     } else {
-      // New session — register in session manager
+      // No existing CLI session — create one and register in session manager.
       const claudeSessionId = sessionManager.getOrCreate(cliInput.agentKey, cliInput.model);
       cliInput.sessionId = claudeSessionId;
       cliInput.isNewSession = true;
+
+      // CRITICAL FIX: The adapter may have detected a continuation (multiple
+      // messages) and set prompt to only the last user message. But since no
+      // CLI session exists, we MUST send the full conversation context so
+      // Claude doesn't lose history. Without this, large-context requests
+      // appear to "restart" the conversation.
+      cliInput.prompt = cliInput.fullPrompt;
+      cliInput.systemPrompt = cliInput.fullSystemPrompt;
+
       console.log(`[Route] New session for agent ${cliInput.agentKey} → ${claudeSessionId}`);
     }
 
