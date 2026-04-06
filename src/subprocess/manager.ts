@@ -178,15 +178,11 @@ export class ClaudeSubprocess extends EventEmitter {
           this.processBuffer();
         });
 
-        // Capture stderr for debugging
+        // Capture stderr — always log for diagnostics
         this.process.stderr?.on("data", (chunk: Buffer) => {
           const errorText = chunk.toString().trim();
           if (errorText) {
-            // Don't emit as error unless it's actually an error
-            // Claude CLI may write debug info to stderr
-            if (process.env.DEBUG_SUBPROCESS) {
-              console.error("[Subprocess stderr]:", errorText.slice(0, 200));
-            }
+            console.error("[Subprocess stderr]:", errorText.slice(0, 500));
           }
         });
 
@@ -266,6 +262,10 @@ export class ClaudeSubprocess extends EventEmitter {
 
       try {
         const message: ClaudeCliMessage = JSON.parse(trimmed);
+        // Log result messages for diagnostics
+        if (isResultMessage(message)) {
+          console.log(`[Subprocess] RESULT: is_error=${message.is_error} subtype=${message.subtype} result="${(message.result || '').slice(0, 300)}"`);
+        }
         this.emit("message", message);
 
         if (isTextBlockStart(message)) {
@@ -294,12 +294,8 @@ export class ClaudeSubprocess extends EventEmitter {
           this.emit("result", message);
         }
       } catch (parseError) {
-        const preview = trimmed.length > 100 ? trimmed.slice(0, 100) + "..." : trimmed;
-        console.warn(
-          `[Subprocess] JSON parse failed (${trimmed.length} chars): ${
-            parseError instanceof Error ? parseError.message : "unknown error"
-          }. Preview: ${preview}`
-        );
+        const preview = trimmed.length > 200 ? trimmed.slice(0, 200) + "..." : trimmed;
+        console.warn(`[Subprocess] Raw line: ${preview}`);
         this.emit("raw", trimmed);
       }
     }

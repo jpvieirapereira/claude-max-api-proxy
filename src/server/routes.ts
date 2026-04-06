@@ -398,6 +398,7 @@ async function handleNonStreamingResponse(
 
     subprocess.on("result", (result: ClaudeCliResult) => {
       finalResult = result;
+      console.log(`[NonStreaming] Result: is_error=${result.is_error} subtype=${result.subtype} result_len=${result.result?.length ?? 'null'} result_preview="${(result.result || '').slice(0, 200)}"`);
     });
 
     subprocess.on("error", (error: Error) => {
