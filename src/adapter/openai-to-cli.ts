@@ -7,8 +7,15 @@ import type { OpenAIChatRequest, OpenAIContentBlock } from "../types/openai.js";
 export type ClaudeModel = "opus" | "sonnet" | "haiku";
 
 export interface CliInput {
+  /** Prompt to send — picked by routes.ts based on session state */
   prompt: string;
+  /** Full conversation context (for new sessions that need full history) */
+  fullPrompt: string;
+  /** Just the last user message (for resumed sessions where CLI has history) */
+  resumePrompt: string;
   systemPrompt?: string;
+  /** Full system prompt (for new sessions that need it) */
+  fullSystemPrompt?: string;
   model: ClaudeModel;
   agentKey: string;
   sessionId?: string;
@@ -206,11 +213,18 @@ export function openaiToCli(request: OpenAIChatRequest): CliInput {
     request.user ||
     `anon-${Date.now().toString(36)}`;
 
+  // Always compute all prompt variants so routes.ts can pick the right one
+  // when the session manager overrides the adapter's new/resume decision.
+  const fullPrompt = messagesToPrompt(request.messages);
+  const fullSystemPrompt = extractSystemPrompt(request.messages);
+  const resumePrompt = lastUserMessage(request.messages);
+
   return {
-    prompt: isNew
-      ? messagesToPrompt(request.messages)
-      : lastUserMessage(request.messages),
-    systemPrompt: isNew ? extractSystemPrompt(request.messages) : undefined,
+    prompt: isNew ? fullPrompt : resumePrompt,
+    fullPrompt,
+    resumePrompt,
+    systemPrompt: isNew ? fullSystemPrompt : undefined,
+    fullSystemPrompt,
     model,
     agentKey,
     sessionId: request.user,
