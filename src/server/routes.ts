@@ -52,9 +52,16 @@ export async function handleChatCompletions(
     // but the CLI session already exists from a previous request.
     const existingSession = sessionManager.get(cliInput.agentKey);
     if (existingSession) {
-      // Resume existing session — override adapter's detection
+      // Resume existing session — override adapter's detection.
+      // CRITICAL: always use resumePrompt (last user message only).
+      // The adapter may have detected a "new session" (e.g. OpenClaw sent
+      // only 1 user message via Telegram) and set prompt to the full
+      // messagesToPrompt output with <system> tags. Sending that to a
+      // --resume session would inject the system prompt again as user
+      // content, confusing Claude and making it appear to restart.
       cliInput.isNewSession = false;
       cliInput.sessionId = existingSession.claudeSessionId;
+      cliInput.prompt = cliInput.resumePrompt;
       cliInput.systemPrompt = undefined; // CLI already has it
       console.log(`[Route] Resuming session for agent ${cliInput.agentKey} → ${existingSession.claudeSessionId}`);
     } else {
