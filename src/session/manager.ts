@@ -100,16 +100,50 @@ class SessionManager {
   }
 
   /**
-   * Delete a session
+   * Delete a session by its key (agentKey or clawdbotId)
    */
-  delete(clawdbotId: string): boolean {
-    const deleted = this.sessions.delete(clawdbotId);
+  delete(key: string): boolean {
+    const deleted = this.sessions.delete(key);
     if (deleted) {
       this.save().catch((err) =>
         console.error("[SessionManager] Save error:", err)
       );
     }
     return deleted;
+  }
+
+  /**
+   * Invalidate a session by agent key (used by gateway sync)
+   */
+  invalidate(agentKey: string): boolean {
+    const deleted = this.sessions.delete(agentKey);
+    if (deleted) {
+      console.log(`[SessionManager] Invalidated session for agent: ${agentKey}`);
+      this.save().catch((err) =>
+        console.error("[SessionManager] Save error:", err)
+      );
+    }
+    return deleted;
+  }
+
+  /**
+   * Invalidate a session by its Claude CLI session ID
+   * (used when gateway sync reports a session reset by CLI session ID)
+   */
+  invalidateByClaudeSessionId(claudeSessionId: string): boolean {
+    for (const [key, session] of this.sessions) {
+      if (session.claudeSessionId === claudeSessionId) {
+        this.sessions.delete(key);
+        console.log(
+          `[SessionManager] Invalidated session ${claudeSessionId} (agent: ${key})`
+        );
+        this.save().catch((err) =>
+          console.error("[SessionManager] Save error:", err)
+        );
+        return true;
+      }
+    }
+    return false;
   }
 
   /**

@@ -7,6 +7,7 @@
 import type { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import { ClaudeSubprocess } from "../subprocess/manager.js";
+import { acquire, queueStats } from "../subprocess/queue.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
 import {
   cliResultToOpenai,
@@ -43,12 +44,32 @@ export async function handleChatCompletions(
 
     // Convert to CLI input format
     const cliInput = openaiToCli(body);
-    const subprocess = new ClaudeSubprocess();
 
-    if (stream) {
-      await handleStreamingResponse(req, res, subprocess, cliInput, requestId);
-    } else {
-      await handleNonStreamingResponse(res, subprocess, cliInput, requestId);
+    // Wait for a per-agent concurrency slot
+    let release: () => void;
+    try {
+      release = await acquire(cliInput.agentKey);
+    } catch (queueErr) {
+      // Queue full or timeout — return 429
+      res.status(429).json({
+        error: {
+          message: queueErr instanceof Error ? queueErr.message : "Queue full",
+          type: "rate_limit_error",
+          code: "queue_full",
+        },
+      });
+      return;
+    }
+
+    try {
+      const subprocess = new ClaudeSubprocess();
+      if (stream) {
+        await handleStreamingResponse(req, res, subprocess, cliInput, requestId);
+      } else {
+        await handleNonStreamingResponse(res, subprocess, cliInput, requestId);
+      }
+    } finally {
+      release();
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unknown error";
@@ -101,13 +122,30 @@ async function handleStreamingResponse(
   // Send initial comment to confirm connection is alive
   res.write(":ok\n\n");
 
-  return new Promise<void>((resolve, reject) => {
+  return new Promise<void>((resolve) => {
     let isFirst = true;
     let lastModel = "claude-opus-4-6";
     let isComplete = false;
     let hasEmittedText = false;
-    let toolCallIndex = 0;
-    let inToolBlock = false;
+    let resolved = false;
+
+    const done = () => {
+      if (!resolved) {
+        resolved = true;
+        clearInterval(heartbeatId);
+        resolve();
+      }
+    };
+
+    // SSE heartbeat: send comment every 15s to keep connection alive
+    // during long-running 1M token processing (prevents proxy/client timeouts)
+    const heartbeatId = setInterval(() => {
+      if (!res.writableEnded) {
+        res.write(":heartbeat\n\n");
+      } else {
+        clearInterval(heartbeatId);
+      }
+    }, 15_000);
 
     // Handle actual client disconnect (response stream closed)
     res.on("close", () => {
@@ -115,7 +153,7 @@ async function handleStreamingResponse(
         // Client disconnected before response completed - kill subprocess
         subprocess.kill();
       }
-      resolve();
+      done();
     });
 
     // When a new text content block starts after we've already emitted text,
@@ -257,7 +295,7 @@ async function handleStreamingResponse(
         res.write("data: [DONE]\n\n");
         res.end();
       }
-      resolve();
+      done();
     });
 
     subprocess.on("error", (error: Error) => {
@@ -270,7 +308,7 @@ async function handleStreamingResponse(
         );
         res.end();
       }
-      resolve();
+      done();
     });
 
     subprocess.on("close", (code: number | null) => {
@@ -285,16 +323,26 @@ async function handleStreamingResponse(
         res.write("data: [DONE]\n\n");
         res.end();
       }
-      resolve();
+      done();
     });
 
     // Start the subprocess
     subprocess.start(cliInput.prompt, {
       model: cliInput.model,
       sessionId: cliInput.sessionId,
+      isNewSession: cliInput.isNewSession,
+      systemPrompt: cliInput.systemPrompt,
     }).catch((err) => {
       console.error("[Streaming] Subprocess start error:", err);
-      reject(err);
+      if (!res.writableEnded) {
+        res.write(
+          `data: ${JSON.stringify({
+            error: { message: err.message, type: "server_error", code: null },
+          })}\n\n`
+        );
+        res.end();
+      }
+      done();
     });
   });
 }
@@ -385,18 +433,19 @@ async function handleNonStreamingResponse(
  */
 export function handleModels(_req: Request, res: Response): void {
   const now = Math.floor(Date.now() / 1000);
-  const modelIds = [
-    "claude-opus-4-6",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5",
+  const models = [
+    { id: "claude-opus-4-6", context_length: 1000000 },
+    { id: "claude-sonnet-4-6", context_length: 1000000 },
+    { id: "claude-haiku-4-5", context_length: 1000000 },
   ];
   res.json({
     object: "list",
-    data: modelIds.map((id) => ({
-      id,
+    data: models.map((m) => ({
+      id: m.id,
       object: "model",
       owned_by: "anthropic",
       created: now,
+      context_length: m.context_length,
     })),
   });
 }
@@ -410,6 +459,7 @@ export function handleHealth(_req: Request, res: Response): void {
   res.json({
     status: "ok",
     provider: "claude-code-cli",
+    queue: queueStats(),
     timestamp: new Date().toISOString(),
   });
 }

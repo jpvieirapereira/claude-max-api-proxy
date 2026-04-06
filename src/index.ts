@@ -47,8 +47,8 @@ function buildModelDefinition(model: (typeof AVAILABLE_MODELS)[number]) {
     reasoning: model.reasoning,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 200000,
-    maxTokens: 8192,
+    contextWindow: 1000000,
+    maxTokens: 32768,
   };
 }
 
@@ -241,3 +241,4 @@ export default claudeCodeCliPlugin;
 export { startServer, stopServer, getServer } from "./server/index.js";
 export { ClaudeSubprocess, verifyClaude, verifyAuth } from "./subprocess/manager.js";
 export { sessionManager } from "./session/manager.js";
+export { gatewaySync } from "./session/gateway-sync.js";

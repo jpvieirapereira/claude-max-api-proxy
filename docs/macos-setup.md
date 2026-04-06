@@ -44,6 +44,11 @@ cat > ~/Library/LaunchAgents/com.claude-code-provider.plist << 'PLIST'
       <string>/Users/YOUR_USERNAME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
       <key>CLAUDE_BIN</key>
       <string>/Users/YOUR_USERNAME/.local/bin/claude</string>
+      <!-- Optional: adjust for your workload -->
+      <key>CLAUDE_TIMEOUT_MS</key>
+      <string>2700000</string>
+      <key>CLAUDE_MAX_CONCURRENT</key>
+      <string>3</string>
     </dict>
   </dict>
 </plist>
@@ -55,6 +60,8 @@ PLIST
    - `/Users/YOUR_USERNAME` with your actual username
    - `CLAUDE_BIN` with the absolute path to the `claude` binary (find it with `which claude`)
    - Ensure the PATH includes the directory containing `claude`
+   - Adjust `CLAUDE_TIMEOUT_MS` for your workload (default 45min, sufficient for 1M tokens)
+   - Adjust `CLAUDE_MAX_CONCURRENT` if you need more parallel processes
 
 ## Load the Service
 

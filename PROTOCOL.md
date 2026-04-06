@@ -147,17 +147,29 @@ When using `--input-format stream-json`, send JSON lines to stdin:
 ## Session Management
 
 - Sessions are identified by UUID
-- Use `--session-id <uuid>` to specify
-- Use `--resume <id>` to continue conversation
-- Sessions persist by default; use `--no-session-persistence` to disable
+- **New session**: `--session-id <uuid>` creates a new persistent session
+- **Resume session**: `--resume <uuid>` continues an existing session with full CLI history
+- Sessions persist on disk by default (the proxy relies on this for conversation continuity)
+- `--no-session-persistence` disables persistence (used for stateless/one-shot requests only)
+
+### Agent Key Derivation
+
+The proxy derives a deterministic agent key from the system prompt + model using djb2 hash:
+```
+agent-{djb2(first_200_chars_of_system_prompt + "|" + model)}
+```
+This ensures the same OpenClaw agent always maps to the same CLI session.
 
 ## Important Notes
 
 1. **OAuth Token Usage**: Claude CLI uses the logged-in user's OAuth token automatically
-2. **Cost Tracking**: Each response includes `total_cost_usd` - this is subscription usage, not API billing
-3. **Tools**: Claude Code has its own tools (Bash, Read, Edit, etc.) - may need to disable or bridge
-4. **MCP Servers**: Session init includes MCP server status
-5. **Streaming**: With `--include-partial-messages`, get real-time chunks
+2. **Cost Tracking**: Each response includes `total_cost_usd` — subscription usage, not API billing
+3. **Tools**: Claude Code tools (Bash, Read, Edit, etc.) are mapped from OpenClaw names via `--append-system-prompt`
+4. **Streaming**: With `--include-partial-messages`, get real-time chunks
+5. **SSE Heartbeat**: Proxy sends `:heartbeat\n\n` every 15s to keep connections alive during long processing
+6. **1M Token Context**: Body parser supports 200MB payloads; subprocess uses StringDecoder for safe UTF-8 and stdin backpressure
+7. **Timeout**: Default 45min (`CLAUDE_TIMEOUT_MS`), with SIGKILL escalation 5s after SIGTERM
+8. **Per-Agent Queue**: Each agent key gets a serialized FIFO queue; global ceiling of `CLAUDE_MAX_CONCURRENT` processes
 
 ## Message Flow for Clawdbot Integration
 

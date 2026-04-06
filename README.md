@@ -36,14 +36,17 @@ Your App (OpenClaw, Continue.dev, etc.)
 
 ## Features
 
+- **1M token context** — Supports Opus 4.6 with full 1M token context window
 - **OpenAI-compatible API** — Works with any client that supports OpenAI's API format
-- **Streaming support** — Real-time token streaming via Server-Sent Events
-- **Multiple models** — Claude Opus, Sonnet, and Haiku with flexible model aliases
-- **OpenClaw integration** — Automatic tool name mapping and system prompt adaptation
-- **Content block handling** — Proper text block separators for multi-block responses
-- **Session management** — Maintains conversation context via session IDs
+- **Streaming with heartbeat** — SSE with 15s heartbeat to prevent timeouts on long requests
+- **Session persistence** — Maintains real CLI sessions via `--resume` (not stateless)
+- **Per-agent queue** — FIFO queue per agent key with global concurrency ceiling
+- **Agent key derivation** — Deterministic identity from system prompt + model (djb2 hash)
+- **OpenClaw gateway sync** — WebSocket integration for session state changes
+- **OpenClaw tool mapping** — Automatic tool name mapping and system prompt adaptation
+- **Multiple models** — Claude Opus 4.6, Sonnet 4.6, and Haiku 4.5
 - **Auto-start service** — Optional LaunchAgent for macOS
-- **Zero configuration** — Uses existing Claude CLI authentication
+- **Robust process management** — SIGKILL escalation, configurable timeouts, backpressure handling
 - **Secure by design** — Uses `spawn()` to prevent shell injection
 
 ## What's Different from the Original
@@ -130,13 +133,13 @@ curl -N -X POST http://localhost:3456/v1/chat/completions \
 
 ## Available Models
 
-| Model ID | Alias | CLI Model |
-|----------|-------|-----------|
-| `claude-opus-4` | `opus` | Claude Opus |
-| `claude-sonnet-4` | `sonnet` | Claude Sonnet |
-| `claude-haiku-4` | `haiku` | Claude Haiku |
+| Model ID | Alias | Context Window | Max Output |
+|----------|-------|---------------|------------|
+| `claude-opus-4-6` | `opus` | 1,000,000 | 32,768 |
+| `claude-sonnet-4-6` | `sonnet` | 1,000,000 | 32,768 |
+| `claude-haiku-4-5` | `haiku` | 1,000,000 | 32,768 |
 
-All model IDs also accept a `claude-code-cli/` prefix (e.g., `claude-code-cli/claude-opus-4`). Unknown models default to Opus.
+All model IDs also accept a `claude-code-cli/` or `claude-max/` prefix. Unknown models default to Opus.
 
 ## Configuration with Popular Tools
 
@@ -176,6 +179,24 @@ response = client.chat.completions.create(
 )
 ```
 
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLAUDE_BIN` | `claude` | Absolute path to the Claude CLI binary |
+| `CLAUDE_TIMEOUT_MS` | `2700000` (45min) | Subprocess timeout in milliseconds |
+| `CLAUDE_MAX_CONCURRENT` | `3` | Max simultaneous CLI processes across all agents |
+| `CLAUDE_MAX_QUEUE_PER_AGENT` | `5` | Max queued requests per agent |
+| `CLAUDE_QUEUE_WAIT_MS` | `60000` (60s) | Max wait time in agent queue before 429 |
+| `DEBUG` | — | Enable request logging |
+| `DEBUG_SUBPROCESS` | — | Enable subprocess debug logging |
+
+## OpenClaw Gateway Sync
+
+If `~/.openclaw/openclaw.json` exists with gateway config, the proxy connects via WebSocket for passive session state sync. When OpenClaw resets or deletes a session, the proxy invalidates its local session automatically.
+
+Works without gateway — graceful degradation.
+
 ## Auto-Start on macOS
 
 The proxy can run as a macOS LaunchAgent on port 3456.
@@ -204,15 +225,17 @@ src/
 │   ├── claude-cli.ts      # Claude CLI JSON streaming types + type guards
 │   └── openai.ts          # OpenAI API types (including tool calls)
 ├── adapter/
-│   ├── openai-to-cli.ts   # Convert OpenAI requests → CLI format
+│   ├── openai-to-cli.ts   # Convert OpenAI requests → CLI format + agent key derivation
 │   └── cli-to-openai.ts   # Convert CLI responses → OpenAI format
 ├── subprocess/
-│   └── manager.ts         # Claude CLI subprocess + OpenClaw tool mapping
+│   ├── manager.ts         # Claude CLI subprocess (StringDecoder, backpressure, SIGKILL)
+│   └── queue.ts           # Per-agent FIFO concurrency queue
 ├── session/
-│   └── manager.ts         # Session ID mapping
+│   ├── manager.ts         # Session mapping + invalidation
+│   └── gateway-sync.ts    # WebSocket sync with OpenClaw gateway
 ├── server/
-│   ├── index.ts           # Express server setup
-│   ├── routes.ts          # API route handlers
+│   ├── index.ts           # Express server setup + gateway init
+│   ├── routes.ts          # API route handlers (SSE heartbeat, per-agent queue)
 │   └── standalone.ts      # Entry point
 └── index.ts               # Package exports
 ```
@@ -226,12 +249,13 @@ src/
 
 ## Troubleshooting
 
-### "Claude CLI not found"
+### "Claude CLI not found" or ENOTDIR error
 
-Install and authenticate the CLI:
+Install and authenticate the CLI, then set `CLAUDE_BIN`:
 ```bash
 npm install -g @anthropic-ai/claude-code
 claude auth login
+export CLAUDE_BIN=$(which claude)
 ```
 
 ### Streaming returns immediately with no content
@@ -241,11 +265,15 @@ Ensure you're using `-N` flag with curl (disables buffering):
 curl -N -X POST http://localhost:3456/v1/chat/completions ...
 ```
 
-### Server won't start
+### Connection drops on long requests
 
-Check that the Claude CLI is in your PATH:
+The proxy sends SSE heartbeat comments every 15s. If you have an intermediate proxy (nginx, HAProxy), ensure its timeout is longer than `CLAUDE_TIMEOUT_MS` (default 45min).
+
+### Queue full (HTTP 429)
+
+Increase concurrency or per-agent queue size:
 ```bash
-which claude
+CLAUDE_MAX_CONCURRENT=5 CLAUDE_MAX_QUEUE_PER_AGENT=10 npm start
 ```
 
 ## Contributing

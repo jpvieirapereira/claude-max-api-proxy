@@ -7,6 +7,7 @@
 import express, { Express, Request, Response, NextFunction } from "express";
 import { createServer, Server } from "http";
 import { handleChatCompletions, handleModels, handleHealth } from "./routes.js";
+import { gatewaySync } from "../session/gateway-sync.js";
 
 export interface ServerConfig {
   port: number;
@@ -21,33 +22,10 @@ let serverInstance: Server | null = null;
 function createApp(): Express {
   const app = express();
 
-  // Middleware: use raw body parser + manual JSON parse for better error diagnostics
-  app.use(express.raw({ type: "application/json", limit: "10mb" }));
-  app.use((req: Request, _res: Response, next: NextFunction) => {
-    if (req.body && Buffer.isBuffer(req.body) && req.body.length > 0) {
-      const raw = req.body.toString("utf8");
-      if (process.env.DEBUG) {
-        console.log("[Body raw]:", raw.substring(0, 200));
-      }
-      try {
-        req.body = JSON.parse(raw);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.error("[Body parse error]:", msg);
-        if (process.env.DEBUG) {
-          console.error("[Body raw]:", raw.substring(0, 300));
-        } else {
-          console.error("[Body metadata]:", {
-            length: raw.length,
-            method: req.method,
-            url: req.originalUrl,
-          });
-        }
-        return next(err);
-      }
-    }
-    next();
-  });
+  // JSON body parser with 200MB limit for 1M+ token contexts
+  // express.json() uses streaming parse — avoids 3x memory amplification
+  // of raw() + toString() + JSON.parse() for large payloads
+  app.use(express.json({ limit: "200mb" }));
 
   // Request logging (debug mode)
   app.use((req: Request, _res: Response, next: NextFunction) => {
@@ -117,6 +95,13 @@ export async function startServer(config: ServerConfig): Promise<Server> {
   return new Promise((resolve, reject) => {
     serverInstance = createServer(app);
 
+    // Disable HTTP server timeouts for long-running 1M+ token requests
+    // The subprocess manager handles its own timeout (CLAUDE_TIMEOUT_MS)
+    serverInstance.timeout = 0;
+    serverInstance.headersTimeout = 0;
+    serverInstance.requestTimeout = 0;
+    serverInstance.keepAliveTimeout = 0;
+
     serverInstance.on("error", (err: NodeJS.ErrnoException) => {
       if (err.code === "EADDRINUSE") {
         reject(new Error(`Port ${port} is already in use`));
@@ -128,6 +113,12 @@ export async function startServer(config: ServerConfig): Promise<Server> {
     serverInstance.listen(port, host, () => {
       console.log(`[Server] Claude Code CLI provider running at http://${host}:${port}`);
       console.log(`[Server] OpenAI-compatible endpoint: http://${host}:${port}/v1/chat/completions`);
+
+      // Initialize gateway sync (non-blocking)
+      gatewaySync.init().catch((err) =>
+        console.warn("[Server] Gateway sync init failed:", err)
+      );
+
       resolve(serverInstance!);
     });
   });
@@ -140,6 +131,9 @@ export async function stopServer(): Promise<void> {
   if (!serverInstance) {
     return;
   }
+
+  // Stop gateway sync first
+  gatewaySync.stop();
 
   return new Promise((resolve, reject) => {
     serverInstance!.close((err) => {

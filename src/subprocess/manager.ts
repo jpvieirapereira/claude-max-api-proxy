@@ -7,6 +7,7 @@
 
 import { spawn, ChildProcess } from "child_process";
 import { EventEmitter } from "events";
+import { StringDecoder } from "string_decoder";
 import fs from "fs/promises";
 import path from "path";
 import type {
@@ -29,6 +30,8 @@ import type { ClaudeModel } from "../adapter/openai-to-cli.js";
 export interface SubprocessOptions {
   model: ClaudeModel;
   sessionId?: string;
+  isNewSession?: boolean;
+  systemPrompt?: string;
   cwd?: string;
   timeout?: number;
 }
@@ -42,7 +45,9 @@ export interface SubprocessEvents {
   raw: (line: string) => void;
 }
 
-const DEFAULT_TIMEOUT = 900000; // 15 minutes
+const DEFAULT_TIMEOUT = parseInt(process.env.CLAUDE_TIMEOUT_MS || "2700000", 10); // 45 min default, configurable
+const MAX_BUFFER_SIZE = 50 * 1024 * 1024; // 50MB safety limit
+const SIGKILL_GRACE_MS = 5000; // 5s grace before SIGKILL
 
 /**
  * System prompt appended to Claude CLI to map OpenClaw tool names to Claude Code equivalents.
@@ -91,7 +96,9 @@ const OPENCLAW_TOOL_MAPPING_PROMPT = [
 export class ClaudeSubprocess extends EventEmitter {
   private process: ChildProcess | null = null;
   private buffer: string = "";
+  private decoder: StringDecoder = new StringDecoder("utf8");
   private timeoutId: NodeJS.Timeout | null = null;
+  private killTimeoutId: NodeJS.Timeout | null = null;
   private isKilled: boolean = false;
 
   /**
@@ -112,18 +119,22 @@ export class ClaudeSubprocess extends EventEmitter {
           stdio: ["pipe", "pipe", "pipe"],
         });
 
-        // Set timeout
+        // Set timeout with SIGKILL escalation
         this.timeoutId = setTimeout(() => {
           if (!this.isKilled) {
             this.isKilled = true;
             this.process?.kill("SIGTERM");
+            // Escalate to SIGKILL if SIGTERM is ignored
+            this.killTimeoutId = setTimeout(() => {
+              try { this.process?.kill("SIGKILL"); } catch { /* already dead */ }
+            }, SIGKILL_GRACE_MS);
             this.emit("error", new Error(`Request timed out after ${timeout}ms`));
           }
         }, timeout);
 
         // Handle spawn errors (e.g., claude not found)
         this.process.on("error", (err: NodeJS.ErrnoException) => {
-          this.clearTimeout();
+          this.clearTimeouts();
           if (err.code === "ENOENT" || err.code === "ENOTDIR") {
             const bin = process.env.CLAUDE_BIN || "claude";
             reject(
@@ -137,21 +148,33 @@ export class ClaudeSubprocess extends EventEmitter {
           }
         });
 
-        // Pass prompt via stdin to avoid E2BIG on large inputs
-        this.process.stdin?.write(prompt);
-        this.process.stdin?.end();
+        // Pass prompt via stdin with backpressure handling for large contexts
+        this.writeStdin(prompt).catch((err) => {
+          this.emit("error", new Error(`stdin write failed: ${err.message}`));
+        });
 
         if (process.env.DEBUG_SUBPROCESS) {
           console.error(`[Subprocess] Process spawned with PID: ${this.process.pid}`);
         }
 
-        // Parse JSON stream from stdout
+        // Parse JSON stream from stdout using StringDecoder for safe UTF-8
         this.process.stdout?.on("data", (chunk: Buffer) => {
-          const data = chunk.toString();
+          const data = this.decoder.write(chunk);
           if (process.env.DEBUG_SUBPROCESS) {
-            console.error(`[Subprocess] Received ${data.length} bytes of stdout`);
+            console.error(`[Subprocess] Received ${chunk.length} bytes of stdout`);
           }
           this.buffer += data;
+
+          // Safety: prevent OOM from malformed output without newlines
+          if (this.buffer.length > MAX_BUFFER_SIZE) {
+            const err = new Error(
+              `Buffer exceeded ${MAX_BUFFER_SIZE} bytes. Possible malformed CLI output.`
+            );
+            this.emit("error", err);
+            this.kill();
+            return;
+          }
+
           this.processBuffer();
         });
 
@@ -172,7 +195,12 @@ export class ClaudeSubprocess extends EventEmitter {
           if (process.env.DEBUG_SUBPROCESS) {
             console.error(`[Subprocess] Process closed with code: ${code}`);
           }
-          this.clearTimeout();
+          this.clearTimeouts();
+          // Flush any remaining bytes from the UTF-8 decoder
+          const remaining = this.decoder.end();
+          if (remaining) {
+            this.buffer += remaining;
+          }
           // Process any remaining buffer
           if (this.buffer.trim()) {
             this.processBuffer();
@@ -183,7 +211,7 @@ export class ClaudeSubprocess extends EventEmitter {
         // Resolve immediately since we're streaming
         resolve();
       } catch (err) {
-        this.clearTimeout();
+        this.clearTimeouts();
         reject(err);
       }
     });
@@ -202,14 +230,24 @@ export class ClaudeSubprocess extends EventEmitter {
       "--include-partial-messages", // Enable streaming chunks
       "--model",
       options.model, // Model alias (opus/sonnet/haiku)
-      "--no-session-persistence", // Don't save sessions
       "--append-system-prompt",
       OPENCLAW_TOOL_MAPPING_PROMPT,
       // Prompt is passed via stdin (avoids E2BIG on large inputs)
     ];
 
     if (options.sessionId) {
-      args.push("--session-id", options.sessionId);
+      if (options.isNewSession) {
+        // New conversation: create session with explicit ID
+        args.push("--session-id", options.sessionId);
+      } else {
+        // Continuation: resume existing session (CLI has full history)
+        args.push("--resume", options.sessionId);
+      }
+    }
+
+    // System prompt only needed for new sessions
+    if (options.systemPrompt) {
+      args.push("--system-prompt", options.systemPrompt);
     }
 
     return args;
@@ -255,31 +293,81 @@ export class ClaudeSubprocess extends EventEmitter {
         } else if (isResultMessage(message)) {
           this.emit("result", message);
         }
-      } catch {
-        // Non-JSON output, emit as raw
+      } catch (parseError) {
+        const preview = trimmed.length > 100 ? trimmed.slice(0, 100) + "..." : trimmed;
+        console.warn(
+          `[Subprocess] JSON parse failed (${trimmed.length} chars): ${
+            parseError instanceof Error ? parseError.message : "unknown error"
+          }. Preview: ${preview}`
+        );
         this.emit("raw", trimmed);
       }
     }
   }
 
   /**
-   * Clear the timeout timer
+   * Write prompt to stdin with backpressure handling for large contexts (1M+ tokens)
    */
-  private clearTimeout(): void {
+  private writeStdin(data: string): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const stdin = this.process?.stdin;
+      if (!stdin) {
+        reject(new Error("Process stdin not available"));
+        return;
+      }
+
+      const onError = (err: Error) => {
+        stdin.removeListener("drain", onDrain);
+        reject(err);
+      };
+      const onDrain = () => {
+        stdin.removeListener("error", onError);
+        stdin.end(resolve);
+      };
+      const finish = () => {
+        stdin.removeListener("error", onError);
+        resolve();
+      };
+
+      stdin.once("error", onError);
+      const ok = stdin.write(data, "utf8");
+      if (ok) {
+        stdin.removeListener("error", onError);
+        stdin.end(finish);
+      } else {
+        stdin.once("drain", onDrain);
+      }
+    });
+  }
+
+  /**
+   * Clear all timeout timers
+   */
+  private clearTimeouts(): void {
     if (this.timeoutId) {
       clearTimeout(this.timeoutId);
       this.timeoutId = null;
     }
+    if (this.killTimeoutId) {
+      clearTimeout(this.killTimeoutId);
+      this.killTimeoutId = null;
+    }
   }
 
   /**
-   * Kill the subprocess
+   * Kill the subprocess with SIGKILL escalation
    */
   kill(signal: NodeJS.Signals = "SIGTERM"): void {
     if (!this.isKilled && this.process) {
       this.isKilled = true;
-      this.clearTimeout();
+      this.clearTimeouts();
       this.process.kill(signal);
+      // Escalate to SIGKILL if needed
+      if (signal !== "SIGKILL") {
+        this.killTimeoutId = setTimeout(() => {
+          try { this.process?.kill("SIGKILL"); } catch { /* already dead */ }
+        }, SIGKILL_GRACE_MS);
+      }
     }
   }
 
