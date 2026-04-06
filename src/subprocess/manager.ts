@@ -122,12 +122,14 @@ export class ClaudeSubprocess extends EventEmitter {
         }, timeout);
 
         // Handle spawn errors (e.g., claude not found)
-        this.process.on("error", (err) => {
+        this.process.on("error", (err: NodeJS.ErrnoException) => {
           this.clearTimeout();
-          if (err.message.includes("ENOENT")) {
+          if (err.code === "ENOENT" || err.code === "ENOTDIR") {
+            const bin = process.env.CLAUDE_BIN || "claude";
             reject(
               new Error(
-                "Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code"
+                `Claude CLI not found at "${bin}". Install with: npm install -g @anthropic-ai/claude-code\n` +
+                  "Then set CLAUDE_BIN to the absolute path (e.g. export CLAUDE_BIN=$(which claude))"
               )
             );
           } else {
@@ -293,20 +295,29 @@ export class ClaudeSubprocess extends EventEmitter {
  * Verify that Claude CLI is installed and accessible
  */
 export async function verifyClaude(): Promise<{ ok: boolean; error?: string; version?: string }> {
+  const bin = process.env.CLAUDE_BIN || "claude";
   return new Promise((resolve) => {
-    const proc = spawn(process.env.CLAUDE_BIN || "claude", ["--version"], { stdio: "pipe" });
+    const proc = spawn(bin, ["--version"], { stdio: "pipe" });
     let output = "";
 
     proc.stdout?.on("data", (chunk: Buffer) => {
       output += chunk.toString();
     });
 
-    proc.on("error", () => {
-      resolve({
-        ok: false,
-        error:
-          "Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code",
-      });
+    proc.on("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "ENOENT" || err.code === "ENOTDIR") {
+        resolve({
+          ok: false,
+          error:
+            `Claude CLI not found at "${bin}". Install with: npm install -g @anthropic-ai/claude-code\n` +
+            "Then set CLAUDE_BIN to the absolute path (e.g. export CLAUDE_BIN=$(which claude))",
+        });
+      } else {
+        resolve({
+          ok: false,
+          error: `Failed to run Claude CLI: ${err.message}`,
+        });
+      }
     });
 
     proc.on("close", (code) => {

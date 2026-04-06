@@ -42,6 +42,8 @@ cat > ~/Library/LaunchAgents/com.claude-code-provider.plist << 'PLIST'
       <string>/Users/YOUR_USERNAME</string>
       <key>PATH</key>
       <string>/Users/YOUR_USERNAME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+      <key>CLAUDE_BIN</key>
+      <string>/Users/YOUR_USERNAME/.local/bin/claude</string>
     </dict>
   </dict>
 </plist>
@@ -51,7 +53,8 @@ PLIST
 2. **Important:** Edit the file and replace:
    - `/path/to/claude-code-cli-provider` with your actual path
    - `/Users/YOUR_USERNAME` with your actual username
-   - Ensure the PATH includes the directory containing `claude` (check with `which claude`)
+   - `CLAUDE_BIN` with the absolute path to the `claude` binary (find it with `which claude`)
+   - Ensure the PATH includes the directory containing `claude`
 
 ## Load the Service
 
@@ -105,6 +108,17 @@ Common issues:
 - Wrong path to `standalone.js`
 - `claude` CLI not in PATH
 - Node.js not found
+
+### `ENOTDIR` or `ENOENT` spawn error
+
+This means the `claude` binary can't be found. LaunchAgents don't load your shell profile, so `claude` may not be in PATH even if it works in your terminal.
+
+Fix: set `CLAUDE_BIN` to the absolute path in the plist:
+```bash
+# Find the absolute path
+which claude
+# Then set it in the plist EnvironmentVariables section
+```
 
 ### Finding the right paths
 

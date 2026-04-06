@@ -15,12 +15,8 @@ export interface CliInput {
 const MODEL_MAP: Record<string, ClaudeModel> = {
   // Direct model names (provider prefixes like `claude-code-cli/` and `claude-max/`
   // are stripped by extractModel before consulting this map)
-  "claude-opus-4": "opus",
   "claude-opus-4-6": "opus",
-  "claude-sonnet-4": "sonnet",
-  "claude-sonnet-4-5": "sonnet",
   "claude-sonnet-4-6": "sonnet",
-  "claude-haiku-4": "haiku",
   "claude-haiku-4-5": "haiku",
   // Bare aliases
   "opus": "opus",
@@ -87,7 +83,7 @@ function stripOpenClawTooling(text: string): string {
     // Match from section header to the next ## header (or end of string)
     const pattern = new RegExp(
       section.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
-        "\\n[\\s\\S]*?(?=\\n## |$)",
+      "\\n[\\s\\S]*?(?=\\n## |$)",
       "g"
     );
     result = result.replace(pattern, "");
