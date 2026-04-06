@@ -4,8 +4,17 @@
  * Passive sync: listens for session state changes (reset, delete, compact)
  * from the OpenClaw gateway and invalidates local sessions accordingly.
  * Graceful degradation: proxy works normally without gateway.
+ *
+ * OpenClaw gateway protocol:
+ *   1. Connect to ws://{host}:{port}/
+ *   2. Server sends connect.challenge with nonce
+ *   3. Client responds with connect.respond containing token + nonce
+ *   4. Server sends connect.ack on success
+ *   5. Client subscribes to channels
+ *   6. Server pushes events
  */
 
+import { randomUUID } from "crypto";
 import fs from "fs/promises";
 import path from "path";
 import { sessionManager } from "./manager.js";
@@ -14,14 +23,6 @@ interface GatewayConfig {
   host: string;
   port: number;
   token?: string;
-}
-
-interface GatewayMessage {
-  type: string;
-  event?: string;
-  sessionId?: string;
-  agentKey?: string;
-  action?: string;
 }
 
 const OPENCLAW_CONFIG_PATH = path.join(
@@ -39,6 +40,7 @@ export class GatewaySync {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private stopped = false;
   private config: GatewayConfig | null = null;
+  private authenticated = false;
 
   /**
    * Initialize: read config and connect if available.
@@ -65,21 +67,31 @@ export class GatewaySync {
     try {
       const raw = await fs.readFile(OPENCLAW_CONFIG_PATH, "utf-8");
       const data = JSON.parse(raw);
-      const gw = data?.gateway || data;
-      if (!gw.host || !gw.port) return null;
-      return { host: gw.host, port: gw.port, token: gw.token };
+      const gw = data?.gateway;
+      if (!gw || !gw.port) return null;
+
+      let host = gw.host;
+      if (!host) {
+        host = gw.bind === "loopback" || gw.bind === "localhost" || !gw.bind
+          ? "127.0.0.1"
+          : gw.bind;
+      }
+
+      const token = gw.token || gw.auth?.token;
+      return { host, port: gw.port, token };
     } catch {
       return null;
     }
   }
 
   /**
-   * Establish WebSocket connection to gateway
+   * Establish WebSocket connection to gateway (root path /)
    */
   private connect(): void {
     if (this.stopped || !this.config) return;
 
-    const url = `ws://${this.config.host}:${this.config.port}/ws/sessions`;
+    this.authenticated = false;
+    const url = `ws://${this.config.host}:${this.config.port}/`;
 
     try {
       this.ws = new WebSocket(url);
@@ -89,53 +101,127 @@ export class GatewaySync {
     }
 
     this.ws.onopen = () => {
-      console.log("[GatewaySync] Connected to gateway");
+      console.log("[GatewaySync] WebSocket connected, waiting for challenge...");
       this.reconnectMs = MIN_RECONNECT_MS;
-
-      // Authenticate if token available
-      if (this.config?.token) {
-        this.ws?.send(JSON.stringify({ type: "auth", token: this.config.token }));
-      }
-
-      // Subscribe to session events
-      this.ws?.send(JSON.stringify({ type: "subscribe", channel: "sessions" }));
     };
 
     this.ws.onmessage = (event) => {
-      this.handleMessage(typeof event.data === "string" ? event.data : "");
+      const raw = typeof event.data === "string" ? event.data : "";
+      this.handleMessage(raw);
     };
 
     this.ws.onclose = () => {
+      this.authenticated = false;
       if (!this.stopped) {
         this.scheduleReconnect();
       }
     };
 
     this.ws.onerror = () => {
-      // onclose will fire after this — reconnect handled there
+      // onclose will fire after this
     };
   }
 
   /**
+   * Send a request frame to the gateway (OpenClaw protocol v3)
+   */
+  private sendRequest(method: string, params: Record<string, unknown> = {}): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({
+        type: "req",
+        id: randomUUID(),
+        method,
+        params,
+      }));
+    }
+  }
+
+  /**
    * Handle incoming gateway message
+   *
+   * OpenClaw protocol v3:
+   *   Event frames:  { type: "event", event: "...", payload: {...}, seq?: N }
+   *   Response frames: { type: "res", id: "...", ok: bool, payload?: {...}, error?: {...} }
    */
   private handleMessage(raw: string): void {
+    let msg: Record<string, unknown>;
     try {
-      const msg: GatewayMessage = JSON.parse(raw);
-
-      if (msg.type === "session.changed" || msg.event === "session.changed") {
-        const action = msg.action || "unknown";
-
-        if (msg.agentKey) {
-          console.log(`[GatewaySync] Session ${action} for agent ${msg.agentKey}`);
-          sessionManager.invalidate(msg.agentKey);
-        } else if (msg.sessionId) {
-          console.log(`[GatewaySync] Session ${action} for CLI session ${msg.sessionId}`);
-          sessionManager.invalidateByClaudeSessionId(msg.sessionId);
-        }
-      }
+      msg = JSON.parse(raw);
     } catch {
-      // Ignore non-JSON or unknown messages
+      return;
+    }
+
+    const type = msg.type as string;
+
+    // Response to our connect request
+    if (type === "res") {
+      const ok = msg.ok as boolean;
+      if (ok && !this.authenticated) {
+        this.authenticated = true;
+        console.log("[GatewaySync] Authenticated with gateway");
+      } else if (!ok && !this.authenticated) {
+        const error = msg.error as { message?: string } | undefined;
+        console.warn("[GatewaySync] Gateway rejected:", error?.message || "unknown");
+        this.stopped = true;
+        this.ws?.close();
+      }
+      return;
+    }
+
+    // Event frames
+    if (type !== "event") return;
+    const event = msg.event as string;
+
+    // Step 1: connect.challenge — send connect request with auth
+    if (event === "connect.challenge") {
+      const payload = msg.payload as { nonce?: string } | undefined;
+      const nonce = payload?.nonce;
+      if (!nonce) return;
+
+      this.sendRequest("connect", {
+        minProtocol: 3,
+        maxProtocol: 3,
+        client: {
+          id: "gateway-client",
+          version: "1.0.0",
+          platform: process.platform,
+          mode: "backend",
+        },
+        caps: [],
+        auth: this.config?.token ? { token: this.config.token } : undefined,
+        role: "operator",
+        scopes: ["operator.read"],
+      });
+      console.log("[GatewaySync] Responded to challenge");
+      return;
+    }
+
+    // Ignore events until authenticated
+    if (!this.authenticated) return;
+
+    // Step 2: Handle session events
+    if (
+      event === "sessions.changed" ||
+      event === "sessions.reset" ||
+      event === "sessions.delete" ||
+      event === "sessions.compact" ||
+      event === "session.changed" ||
+      event === "session.reset" ||
+      event === "session.deleted" ||
+      event === "session.compact"
+    ) {
+      const data = (msg.payload || msg) as Record<string, unknown>;
+      const agentKey = data.agentKey as string | undefined;
+      const sessionId = (data.sessionId || data.key) as string | undefined;
+      const action = event.replace(/^sessions?\./, "");
+
+      if (agentKey) {
+        console.log(`[GatewaySync] Session ${action} for agent ${agentKey}`);
+        sessionManager.invalidate(agentKey);
+      } else if (sessionId) {
+        console.log(`[GatewaySync] Session ${action} for session ${sessionId}`);
+        sessionManager.invalidateByClaudeSessionId(sessionId);
+      }
     }
   }
 
@@ -168,10 +254,10 @@ export class GatewaySync {
   }
 
   /**
-   * Check if connected to gateway
+   * Check if connected and authenticated
    */
   get connected(): boolean {
-    return this.ws?.readyState === WebSocket.OPEN;
+    return this.authenticated && this.ws?.readyState === WebSocket.OPEN;
   }
 }
 

@@ -9,6 +9,7 @@ import { v4 as uuidv4 } from "uuid";
 import { ClaudeSubprocess } from "../subprocess/manager.js";
 import { acquire, queueStats } from "../subprocess/queue.js";
 import { openaiToCli } from "../adapter/openai-to-cli.js";
+import { sessionManager } from "../session/manager.js";
 import {
   cliResultToOpenai,
   createDoneChunk,
@@ -44,6 +45,25 @@ export async function handleChatCompletions(
 
     // Convert to CLI input format
     const cliInput = openaiToCli(body);
+
+    // Use session manager to determine if this agent already has a CLI session.
+    // This is the source of truth — NOT the message count.
+    // Via Telegram, OpenClaw may send only 1 user message without history,
+    // but the CLI session already exists from a previous request.
+    const existingSession = sessionManager.get(cliInput.agentKey);
+    if (existingSession) {
+      // Resume existing session — override adapter's detection
+      cliInput.isNewSession = false;
+      cliInput.sessionId = existingSession.claudeSessionId;
+      cliInput.systemPrompt = undefined; // CLI already has it
+      console.log(`[Route] Resuming session for agent ${cliInput.agentKey} → ${existingSession.claudeSessionId}`);
+    } else {
+      // New session — register in session manager
+      const claudeSessionId = sessionManager.getOrCreate(cliInput.agentKey, cliInput.model);
+      cliInput.sessionId = claudeSessionId;
+      cliInput.isNewSession = true;
+      console.log(`[Route] New session for agent ${cliInput.agentKey} → ${claudeSessionId}`);
+    }
 
     // Wait for a per-agent concurrency slot
     let release: () => void;
