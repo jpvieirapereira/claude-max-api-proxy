@@ -52,16 +52,32 @@ export async function handleChatCompletions(
     // but the CLI session already exists from a previous request.
     const existingSession = sessionManager.get(cliInput.agentKey);
     if (existingSession) {
-      // Resume existing session — override adapter's detection
+      // Resume existing session — override adapter's detection.
+      // CRITICAL: always use resumePrompt (last user message only).
+      // The adapter may have detected a "new session" (e.g. OpenClaw sent
+      // only 1 user message via Telegram) and set prompt to the full
+      // messagesToPrompt output with <system> tags. Sending that to a
+      // --resume session would inject the system prompt again as user
+      // content, confusing Claude and making it appear to restart.
       cliInput.isNewSession = false;
       cliInput.sessionId = existingSession.claudeSessionId;
+      cliInput.prompt = cliInput.resumePrompt;
       cliInput.systemPrompt = undefined; // CLI already has it
       console.log(`[Route] Resuming session for agent ${cliInput.agentKey} → ${existingSession.claudeSessionId}`);
     } else {
-      // New session — register in session manager
+      // No existing CLI session — create one and register in session manager.
       const claudeSessionId = sessionManager.getOrCreate(cliInput.agentKey, cliInput.model);
       cliInput.sessionId = claudeSessionId;
       cliInput.isNewSession = true;
+
+      // CRITICAL FIX: The adapter may have detected a continuation (multiple
+      // messages) and set prompt to only the last user message. But since no
+      // CLI session exists, we MUST send the full conversation context so
+      // Claude doesn't lose history. Without this, large-context requests
+      // appear to "restart" the conversation.
+      cliInput.prompt = cliInput.fullPrompt;
+      cliInput.systemPrompt = cliInput.fullSystemPrompt;
+
       console.log(`[Route] New session for agent ${cliInput.agentKey} → ${claudeSessionId}`);
     }
 
